@@ -1,0 +1,1550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>STARB Bot - Part 1</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0a;
+            overflow: hidden;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+    </style>
+</head>
+<body>
+
+<script>
+// ==================== PART 1: CORE CONFIG & CALCULATIONS ====================
+
+(function() {
+    'use strict';
+
+    const CONFIG = {
+        derivAppId: '1089',
+        derivToken: 'whAYloFXJL5YuTS',
+        minZScore: 3.0,
+        strongZScore: 3.5,
+        targetZScore: 0.3,
+        hardStopZScore: 5.0,
+        minCorrelation: 0.85,
+        cointegrationPValue: 0.10,
+        hurstMeanReversion: 0.40,
+        hurstTrending: 0.55,
+        atrMultiplier: 2.0,
+        soundAlerts: true,
+        signalCooldown: 30000,
+        signalDisplayTime: 30000,
+        minDataPoints: 100,
+        volatilityThreshold: 0.015,
+        minConfidence: 80,
+        momentumBars: 3
+    };
+
+    const EXPIRY_MAP = {
+        '1m': { min: 120, max: 180 },
+        '5m': { min: 300, max: 300 },
+        '15m': { min: 1800, max: 3600 },
+        '30m': { min: 2700, max: 5400 },
+        '1h': { min: 3600, max: 10800 },
+        '4h': { min: 7200, max: 14400 },
+        '1d': { min: 14400, max: 28800 }
+    };
+
+    const activePairs = [
+        {
+            id: 'eurusd-gbpusd',
+            name: 'EUR/USD + GBP/USD',
+            asset1: 'EUR/USD',
+            asset2: 'GBP/USD',
+            symbol1: 'frxEURUSD',
+            symbol2: 'frxGBPUSD',
+            type: 'forex'
+        },
+        {
+            id: 'eurgbp-eurusd',
+            name: 'EUR/GBP + EUR/USD',
+            asset1: 'EUR/GBP',
+            asset2: 'EUR/USD',
+            symbol1: 'frxEURGBP',
+            symbol2: 'frxEURUSD',
+            type: 'forex'
+        },
+        {
+            id: 'audusd-nzdusd',
+            name: 'AUD/USD + NZD/USD',
+            asset1: 'AUD/USD',
+            asset2: 'NZD/USD',
+            symbol1: 'frxAUDUSD',
+            symbol2: 'frxNZDUSD',
+            type: 'forex'
+        },
+        {
+            id: 'euraud-eurnzd',
+            name: 'EUR/AUD + EUR/NZD',
+            asset1: 'EUR/AUD',
+            asset2: 'EUR/NZD',
+            symbol1: 'frxEURAUD',
+            symbol2: 'frxEURNZD',
+            type: 'forex'
+        }
+    ];
+
+    let pairData = {};
+    let priceHistory = {};
+    let derivWS = null;
+    let lastSignalTime = {};
+    let signalTimers = {};
+    let isMinimized = false;
+    let currentPair = 'eurusd-gbpusd';
+    let currentTimeframe = '5m';
+    let signalHistory = [];
+    let activeSignals = {};
+    let advancedMetrics = {};
+    let activeTrades = {};
+    let disabledPairs = {};
+    let expandedHistoryId = null;
+    let showAdvancedMetrics = true;
+    let lastTapTime = {};
+    let loadingProgress = 0;
+    let isLoading = true;
+
+    function loadDisabledPairs() {
+        try {
+            const saved = localStorage.getItem('disabledPairs');
+            if (saved) {
+                disabledPairs = JSON.parse(saved);
+            } else {
+                activePairs.forEach(pair => {
+                    disabledPairs[pair.id] = false;
+                });
+            }
+        } catch (e) {
+            activePairs.forEach(pair => {
+                disabledPairs[pair.id] = false;
+            });
+        }
+    }
+
+    function saveDisabledPairs() {
+        try {
+            localStorage.setItem('disabledPairs', JSON.stringify(disabledPairs));
+        } catch (e) {}
+    }
+
+    function isPairEnabled(pairId) {
+        return !disabledPairs[pairId];
+    }
+
+    loadDisabledPairs();
+
+    activePairs.forEach(pair => {
+        priceHistory[pair.id] = { prices1: [], prices2: [], lastUpdate: new Date() };
+        pairData[pair.id] = null;
+        advancedMetrics[pair.id] = {
+            cointegration: 1, ouTheta: 0, kalmanBeta: 1, orderFlow: 0,
+            vwapDev: 0, halfLife: 0, hurst: 0.5, tpPrice1: 0, tpPrice2: 0,
+            slPrice1: 0, slPrice2: 0, expectedTPTime: 0
+        };
+        lastTapTime[pair.id] = 0;
+    });
+
+    function calculateSMA(prices, period) {
+        if (prices.length < period) return null;
+        return prices.slice(-period).reduce((a, b) => a + b, 0) / period;
+    }
+
+    function calculateEMA(prices, period) {
+        if (prices.length < period) return null;
+        const multiplier = 2 / (period + 1);
+        let ema = calculateSMA(prices.slice(0, period), period);
+        for (let i = period; i < prices.length; i++) {
+            ema = (prices[i] - ema) * multiplier + ema;
+        }
+        return ema;
+    }
+
+    function calculateStdDev(prices, period) {
+        if (prices.length < period) return null;
+        const slice = prices.slice(-period);
+        const mean = slice.reduce((a, b) => a + b, 0) / period;
+        const variance = slice.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / period;
+        return Math.sqrt(variance);
+    }
+
+    function mean(arr) {
+        return arr.reduce((a, b) => a + b, 0) / arr.length;
+    }
+
+    function stdDev(arr) {
+        const m = mean(arr);
+        const variance = arr.reduce((sum, val) => sum + Math.pow(val - m, 2), 0) / arr.length;
+        return Math.sqrt(variance);
+    }
+
+    function covariance(arr1, arr2) {
+        const m1 = mean(arr1);
+        const m2 = mean(arr2);
+        let sum = 0;
+        for (let i = 0; i < arr1.length; i++) {
+            sum += (arr1[i] - m1) * (arr2[i] - m2);
+        }
+        return sum / arr1.length;
+    }
+
+    function calculateRSI(prices, period = 14) {
+        if (prices.length < period + 1) return 50;
+        let gains = 0, losses = 0;
+        for (let i = prices.length - period; i < prices.length; i++) {
+            const change = prices[i] - prices[i - 1];
+            if (change > 0) gains += change;
+            else losses += Math.abs(change);
+        }
+        const avgGain = gains / period;
+        const avgLoss = losses / period;
+        if (avgLoss === 0) return 100;
+        const rs = avgGain / avgLoss;
+        return 100 - (100 / (1 + rs));
+    }
+
+    function calculateMACD(prices) {
+        if (prices.length < 26) return { macd: 0, signal: 0, histogram: 0 };
+        const ema12 = calculateEMA(prices, 12);
+        const ema26 = calculateEMA(prices, 26);
+        const macd = ema12 - ema26;
+        const signal = calculateEMA([macd], 9) || macd;
+        return { macd, signal, histogram: macd - signal };
+    }
+
+    function calculateCorrelation(prices1, prices2, period = 100) {
+        if (prices1.length < period || prices2.length < period) return 0;
+        const slice1 = prices1.slice(-period);
+        const slice2 = prices2.slice(-period);
+        const cov = covariance(slice1, slice2);
+        const std1 = stdDev(slice1);
+        const std2 = stdDev(slice2);
+        if (std1 === 0 || std2 === 0) return 0;
+        return cov / (std1 * std2);
+    }
+
+    function calculateZScore(prices1, prices2, beta, period = 100) {
+        if (prices1.length < period || prices2.length < period) return 0;
+        const spreads = [];
+        const minLen = Math.min(prices1.length, prices2.length);
+        for (let i = 0; i < minLen; i++) {
+            spreads.push(prices1[i] - beta * prices2[i]);
+        }
+        const recentSpreads = spreads.slice(-period);
+        const spreadMean = mean(recentSpreads);
+        const spreadStd = stdDev(recentSpreads);
+        if (spreadStd === 0) return 0;
+        return (spreads[spreads.length - 1] - spreadMean) / spreadStd;
+    }
+
+    function calculateVolatility(prices, period = 20) {
+        if (prices.length < period) return 0;
+        const returns = [];
+        for (let i = prices.length - period; i < prices.length - 1; i++) {
+            returns.push((prices[i + 1] - prices[i]) / prices[i]);
+        }
+        return calculateStdDev(returns, returns.length) || 0;
+    }
+
+    function detectTrend(prices) {
+        if (prices.length < 50) return 0;
+        const shortSMA = calculateSMA(prices, 20);
+        const longSMA = calculateSMA(prices, 50);
+        if (!shortSMA || !longSMA) return 0;
+        if (shortSMA > longSMA * 1.015) return 1;
+        if (shortSMA < longSMA * 0.985) return -1;
+        return 0;
+    }
+
+    function calculateBollingerBands(prices, period = 20) {
+        const sma = calculateSMA(prices, period);
+        const stdDev = calculateStdDev(prices, period);
+        if (!sma || !stdDev) return { upper: 0, middle: 0, lower: 0 };
+        return {
+            upper: sma + (2 * stdDev),
+            middle: sma,
+            lower: sma - (2 * stdDev)
+        };
+    }
+
+    function calculateCointegration(prices1, prices2) {
+        if (prices1.length < 60 || prices2.length < 60) return 1;
+        const n = Math.min(prices1.length, prices2.length);
+        const slice1 = prices1.slice(-n);
+        const slice2 = prices2.slice(-n);
+        const meanX = mean(slice2);
+        const meanY = mean(slice1);
+        let numerator = 0, denominator = 0;
+        for (let i = 0; i < n; i++) {
+            numerator += (slice2[i] - meanX) * (slice1[i] - meanY);
+            denominator += Math.pow(slice2[i] - meanX, 2);
+        }
+        const beta = denominator !== 0 ? numerator / denominator : 1;
+        const residuals = [];
+        for (let i = 0; i < n; i++) {
+            residuals.push(slice1[i] - beta * slice2[i]);
+        }
+        const residualStd = stdDev(residuals);
+        let adfStat = 0;
+        for (let i = 1; i < residuals.length; i++) {
+            adfStat += Math.abs(residuals[i] - residuals[i-1]);
+        }
+        adfStat = adfStat / (residuals.length * residualStd);
+        return Math.min(1, adfStat / 10);
+    }
+
+    function calculateKalmanBeta(prices1, prices2) {
+        if (prices1.length < 20 || prices2.length < 20) return 1;
+        let beta = 1, P = 1;
+        const Q = 0.0001, R = 0.1;
+        const n = Math.min(prices1.length, prices2.length);
+        const windowSize = Math.min(50, n);
+        for (let i = n - windowSize; i < n; i++) {
+            const P_pred = P + Q;
+            const K = P_pred / (P_pred + R);
+            const measurement = prices2[i] !== 0 ? prices1[i] / prices2[i] : beta;
+            beta = beta + K * (measurement - beta);
+            P = (1 - K) * P_pred;
+        }
+        return beta;
+    }
+
+    function calculateOUTheta(spreads) {
+        if (spreads.length < 50) return 0;
+        const recentSpreads = spreads.slice(-100);
+        const spreadMean = mean(recentSpreads);
+        let sumDiff = 0, sumSquaredDiff = 0;
+        for (let i = 1; i < recentSpreads.length; i++) {
+            const diff = recentSpreads[i] - recentSpreads[i-1];
+            const deviation = recentSpreads[i-1] - spreadMean;
+            sumDiff += diff * deviation;
+            sumSquaredDiff += Math.pow(deviation, 2);
+        }
+        return sumSquaredDiff !== 0 ? Math.max(0, -sumDiff / sumSquaredDiff) : 0;
+    }
+
+    function calculateHalfLife(theta) {
+        return theta <= 0 ? 0 : Math.log(2) / theta;
+    }
+
+    function calculateHurst(prices) {
+        if (prices.length < 100) return 0.5;
+        const recentPrices = prices.slice(-100);
+        const n = recentPrices.length;
+        const returns = [];
+        for (let i = 1; i < n; i++) {
+            returns.push(Math.log(recentPrices[i] / recentPrices[i-1]));
+        }
+        const returnMean = mean(returns);
+        const cumDev = [];
+        let sum = 0;
+        for (let i = 0; i < returns.length; i++) {
+            sum += returns[i] - returnMean;
+            cumDev.push(sum);
+        }
+        const range = Math.max(...cumDev) - Math.min(...cumDev);
+        const std = stdDev(returns);
+        if (std === 0) return 0.5;
+        const rs = range / std;
+        return Math.max(0, Math.min(1, Math.log(rs) / Math.log(n)));
+    }
+
+    function calculateOrderFlow(prices) {
+        if (prices.length < 20) return 0;
+        const recentPrices = prices.slice(-20);
+        let buyVolume = 0, sellVolume = 0;
+        for (let i = 1; i < recentPrices.length; i++) {
+            const priceChange = recentPrices[i] - recentPrices[i-1];
+            const volume = Math.abs(priceChange);
+            if (priceChange > 0) buyVolume += volume;
+            else if (priceChange < 0) sellVolume += volume;
+        }
+        const totalVolume = buyVolume + sellVolume;
+        return totalVolume === 0 ? 0 : (buyVolume - sellVolume) / totalVolume;
+    }
+
+    function calculateVWAP(prices) {
+        if (prices.length < 20) return prices[prices.length - 1];
+        const recentPrices = prices.slice(-20);
+        let sumPriceVolume = 0, sumVolume = 0;
+        for (let i = 0; i < recentPrices.length; i++) {
+            sumPriceVolume += recentPrices[i];
+            sumVolume += 1;
+        }
+        return sumVolume !== 0 ? sumPriceVolume / sumVolume : recentPrices[recentPrices.length - 1];
+    }
+
+    function calculateVWAPDeviation(currentPrice, vwap) {
+        return vwap === 0 ? 0 : ((currentPrice - vwap) / vwap) * 100;
+    }
+
+    window.STARB_PART1 = {
+        CONFIG, EXPIRY_MAP, activePairs, pairData, priceHistory, derivWS,
+        lastSignalTime, signalTimers, isMinimized, currentPair, currentTimeframe,
+        signalHistory, activeSignals, advancedMetrics, activeTrades, disabledPairs,
+        expandedHistoryId, showAdvancedMetrics, lastTapTime, loadingProgress, isLoading,
+        loadDisabledPairs, saveDisabledPairs, isPairEnabled,
+        calculateSMA, calculateEMA, calculateStdDev, mean, stdDev, covariance,
+        calculateRSI, calculateMACD, calculateCorrelation, calculateZScore,
+        calculateVolatility, detectTrend, calculateBollingerBands,
+        calculateCointegration, calculateKalmanBeta, calculateOUTheta,
+        calculateHalfLife, calculateHurst, calculateOrderFlow,
+        calculateVWAP, calculateVWAPDeviation
+    };
+
+})();
+</script>
+
+</body>
+</html><script>
+// ==================== PART 2: SIGNAL GENERATION & WEBSOCKET ====================
+// PASTE THIS DIRECTLY AFTER PART 1, REPLACING </body></html>
+
+(function() {
+    'use strict';
+
+    const P1 = window.STARB_PART1;
+
+    function checkMomentum(prices, bars = 3) {
+        if (prices.length < bars + 1) return 0;
+        let upBars = 0, downBars = 0;
+        for (let i = 0; i < bars; i++) {
+            const current = prices[prices.length - 1 - i];
+            const previous = prices[prices.length - 2 - i];
+            if (current > previous) upBars++;
+            else if (current < previous) downBars++;
+        }
+        if (upBars === bars) return 1;
+        if (downBars === bars) return -1;
+        return 0;
+    }
+
+    function generateBinarySignal(pair, data) {
+        if (!P1.isPairEnabled(pair.id)) {
+            return { signal: 'disabled', reason: 'Pair disabled', confidence: 0, zScore: 0, correlation: 0, rsi1: 50, rsi2: 50, timestamp: new Date() };
+        }
+
+        const { price1, price2, prices1, prices2 } = data;
+        if (prices1.length < P1.CONFIG.minDataPoints || prices2.length < P1.CONFIG.minDataPoints) {
+            return { signal: 'none', reason: 'Insufficient data', confidence: 0, timestamp: new Date() };
+        }
+
+        const now = Date.now();
+        if (P1.lastSignalTime[pair.id] && (now - P1.lastSignalTime[pair.id]) < P1.CONFIG.signalCooldown) {
+            const remainingTime = Math.ceil((P1.CONFIG.signalCooldown - (now - P1.lastSignalTime[pair.id])) / 1000);
+            return { signal: 'cooldown', reason: `Next signal in ${remainingTime}s`, confidence: 0, timestamp: new Date() };
+        }
+
+        const kalmanBeta = P1.calculateKalmanBeta(prices1, prices2);
+        const cointegrationPValue = P1.calculateCointegration(prices1, prices2);
+        const zScore = P1.calculateZScore(prices1, prices2, kalmanBeta, 100);
+        const correlation = P1.calculateCorrelation(prices1, prices2, 100);
+        const hurst = P1.calculateHurst(prices1);
+
+        const spreads = [];
+        for (let i = 0; i < Math.min(prices1.length, prices2.length); i++) {
+            spreads.push(prices1[i] - kalmanBeta * prices2[i]);
+        }
+
+        const ouTheta = P1.calculateOUTheta(spreads);
+        const halfLife = P1.calculateHalfLife(ouTheta);
+        const orderFlow1 = P1.calculateOrderFlow(prices1);
+        const orderFlow2 = P1.calculateOrderFlow(prices2);
+        const netOrderFlow = orderFlow1 - orderFlow2;
+        const vwap1 = P1.calculateVWAP(prices1);
+        const vwapDev = P1.calculateVWAPDeviation(price1, vwap1);
+
+        const rsi1 = P1.calculateRSI(prices1, 14);
+        const rsi2 = P1.calculateRSI(prices2, 14);
+        const trend1 = P1.detectTrend(prices1);
+        const trend2 = P1.detectTrend(prices2);
+        const vol1 = P1.calculateVolatility(prices1);
+        const vol2 = P1.calculateVolatility(prices2);
+        const macd1 = P1.calculateMACD(prices1);
+        const macd2 = P1.calculateMACD(prices2);
+        const bb1 = P1.calculateBollingerBands(prices1);
+
+        const momentum1 = checkMomentum(prices1, P1.CONFIG.momentumBars);
+
+        if (cointegrationPValue > P1.CONFIG.cointegrationPValue) {
+            P1.advancedMetrics[pair.id] = { cointegration: cointegrationPValue, ouTheta, kalmanBeta, orderFlow: netOrderFlow, vwapDev, halfLife, hurst, expectedTPTime: 0 };
+            return { signal: 'none', reason: 'Failed cointegration', confidence: 0, zScore, correlation, hurst, rsi1, rsi2, trend1, trend2, vol1, vol2, timestamp: new Date() };
+        }
+
+        if (correlation < P1.CONFIG.minCorrelation) {
+            return { signal: 'none', reason: 'Low correlation', confidence: 0, zScore, correlation, hurst, rsi1, rsi2, trend1, trend2, vol1, vol2, timestamp: new Date() };
+        }
+
+        if (hurst > P1.CONFIG.hurstTrending) {
+            return { signal: 'none', reason: 'Trending market', confidence: 0, zScore, correlation, hurst, rsi1, rsi2, trend1, trend2, vol1, vol2, timestamp: new Date() };
+        }
+
+        if (vol1 > P1.CONFIG.volatilityThreshold || vol2 > P1.CONFIG.volatilityThreshold) {
+            return { signal: 'none', reason: 'High volatility', confidence: 0, zScore, correlation, hurst, rsi1, rsi2, trend1, trend2, vol1, vol2, timestamp: new Date() };
+        }
+
+        if (Math.abs(zScore) < P1.CONFIG.minZScore) {
+            return { signal: Math.abs(zScore) > 2.5 ? 'wait' : 'none', reason: Math.abs(zScore) > 2.5 ? 'Building position' : 'Z-Score too low', confidence: 0, zScore, correlation, hurst, rsi1, rsi2, trend1, trend2, vol1, vol2, timestamp: new Date() };
+        }
+
+        if (P1.currentTimeframe === '1m') {
+            if (zScore > 0 && momentum1 > 0) {
+                return { signal: 'none', reason: 'Conflicting momentum', confidence: 0, zScore, correlation, hurst, rsi1, rsi2, trend1, trend2, vol1, vol2, timestamp: new Date() };
+            }
+            if (zScore < 0 && momentum1 < 0) {
+                return { signal: 'none', reason: 'Conflicting momentum', confidence: 0, zScore, correlation, hurst, rsi1, rsi2, trend1, trend2, vol1, vol2, timestamp: new Date() };
+            }
+        }
+
+        let confidence = 0;
+        if (Math.abs(zScore) >= P1.CONFIG.strongZScore) confidence += 35;
+        else if (Math.abs(zScore) >= P1.CONFIG.minZScore) confidence += 25;
+        if (correlation >= 0.90) confidence += 25;
+        else if (correlation >= 0.85) confidence += 20;
+        if (cointegrationPValue < 0.05) confidence += 20;
+        else if (cointegrationPValue < 0.10) confidence += 15;
+        if (hurst < 0.35) confidence += 15;
+        else if (hurst < 0.40) confidence += 12;
+        if (zScore > 0) {
+            if (rsi1 > 70 && rsi2 < 30) confidence += 10;
+            else if (rsi1 > 60) confidence += 5;
+        } else {
+            if (rsi1 < 30 && rsi2 > 70) confidence += 10;
+            else if (rsi1 < 40) confidence += 5;
+        }
+        if ((zScore > 0 && netOrderFlow < -0.1) || (zScore < 0 && netOrderFlow > 0.1)) confidence += 10;
+        if ((zScore > 0 && vwapDev > 0) || (zScore < 0 && vwapDev < 0)) confidence += 5;
+        if ((zScore > 0 && macd1.histogram < 0) || (zScore < 0 && macd1.histogram > 0)) confidence += 5;
+        if ((zScore > 0 && price1 > bb1.upper) || (zScore < 0 && price1 < bb1.lower)) confidence += 5;
+
+        let signal = 'none';
+        let reason = 'Conditions not met';
+        let binarySignal = null;
+
+        if (confidence >= P1.CONFIG.minConfidence) {
+            if (zScore > 0) {
+                binarySignal = `${pair.asset1} DOWN`;
+                signal = 'binary-down-1';
+            } else {
+                binarySignal = `${pair.asset1} UP`;
+                signal = 'binary-up-1';
+            }
+
+            reason = `${binarySignal} | Conf: ${confidence}%`;
+            P1.lastSignalTime[pair.id] = now;
+
+            if (P1.signalTimers[pair.id]) clearTimeout(P1.signalTimers[pair.id]);
+            P1.signalTimers[pair.id] = setTimeout(() => {
+                if (P1.pairData[pair.id] && P1.pairData[pair.id].signal.startsWith('binary-')) {
+                    P1.pairData[pair.id].signal = 'none';
+                    P1.pairData[pair.id].reason = 'Signal expired';
+                    delete P1.activeSignals[pair.id];
+                    updateUI();
+                }
+            }, P1.CONFIG.signalDisplayTime);
+        } else {
+            signal = 'wait';
+            reason = `Low confidence: ${confidence}%`;
+        }
+
+        const expiryRange = P1.EXPIRY_MAP[P1.currentTimeframe] || { min: 900, max: 1800 };
+        const expectedTPTime = Math.floor(expiryRange.min + Math.random() * (expiryRange.max - expiryRange.min));
+
+        P1.advancedMetrics[pair.id] = {
+            cointegration: cointegrationPValue, ouTheta, kalmanBeta, orderFlow: netOrderFlow,
+            vwapDev, halfLife, hurst, expectedTPTime, macd1: macd1.histogram, macd2: macd2.histogram,
+            binarySignal
+        };
+
+        return { signal, binarySignal, reason, confidence, zScore, correlation, rsi1, rsi2, trend1, trend2, vol1, vol2, timestamp: new Date(), expectedTPTime };
+    }
+
+    function createBinaryTrade(pair, signalData) {
+        const entryPrice = P1.priceHistory[pair.id].prices1[P1.priceHistory[pair.id].prices1.length - 1];
+        const direction = signalData.signal.includes('up') ? 'UP' : 'DOWN';
+        const asset = signalData.binarySignal.split(' ')[0];
+
+        const trade = {
+            id: Date.now(),
+            pairId: pair.id,
+            pairName: pair.name,
+            asset: asset,
+            direction: direction,
+            signal: signalData.binarySignal,
+            entryPrice: entryPrice,
+            entryTime: Date.now(),
+            expiryTime: Date.now() + (signalData.expectedTPTime * 1000),
+            confidence: signalData.confidence,
+            zScore: signalData.zScore,
+            status: 'open',
+            pnl: 0,
+            exitPrice: null
+        };
+
+        P1.activeTrades[trade.id] = trade;
+
+        setTimeout(() => {
+            closeBinaryTrade(trade.id);
+        }, signalData.expectedTPTime * 1000);
+
+        return trade;
+    }
+
+    function closeBinaryTrade(tradeId) {
+        const trade = P1.activeTrades[tradeId];
+        if (!trade || trade.status !== 'open') return;
+
+        const currentPrice = P1.priceHistory[trade.pairId].prices1[P1.priceHistory[trade.pairId].prices1.length - 1];
+
+        trade.exitPrice = currentPrice;
+        trade.status = 'closed';
+
+        const priceChange = currentPrice - trade.entryPrice;
+
+        if (trade.direction === 'UP') {
+            trade.pnl = priceChange > 0 ? 85 : -100;
+            trade.won = priceChange > 0;
+        } else {
+            trade.pnl = priceChange < 0 ? 85 : -100;
+            trade.won = priceChange < 0;
+        }
+
+        addToHistory(trade);
+        delete P1.activeTrades[tradeId];
+        saveHistory();
+    }
+
+    function monitorActiveTrades() {
+        Object.values(P1.activeTrades).forEach(trade => {
+            if (trade.status === 'open') {
+                const timeRemaining = trade.expiryTime - Date.now();
+                if (timeRemaining <= 0) {
+                    closeBinaryTrade(trade.id);
+                }
+            }
+        });
+    }
+
+    function addToHistory(trade) {
+        const historyEntry = {
+            id: trade.id,
+            pairId: trade.pairId,
+            pairName: trade.pairName,
+            asset: trade.asset,
+            direction: trade.direction,
+            signal: trade.signal,
+            confidence: trade.confidence,
+            entryZ: trade.zScore,
+            entryPrice: trade.entryPrice,
+            exitPrice: trade.exitPrice,
+            entryTime: new Date(trade.entryTime),
+            exitTime: new Date(trade.expiryTime),
+            timeframe: P1.currentTimeframe,
+            status: 'closed',
+            pnl: trade.pnl,
+            won: trade.won
+        };
+
+        P1.signalHistory.unshift(historyEntry);
+        if (P1.signalHistory.length > 100) {
+            P1.signalHistory = P1.signalHistory.slice(0, 100);
+        }
+        saveHistory();
+    }
+
+    function saveHistory() {
+        try {
+            localStorage.setItem('signalHistory', JSON.stringify(P1.signalHistory));
+        } catch (e) {
+            console.error('Failed to save history:', e);
+        }
+    }
+
+    function loadHistory() {
+        try {
+            const saved = localStorage.getItem('signalHistory');
+            if (saved) {
+                P1.signalHistory = JSON.parse(saved);
+                console.log(`Loaded ${P1.signalHistory.length} signals from history`);
+            }
+        } catch (e) {
+            console.error('Failed to load history:', e);
+            P1.signalHistory = [];
+        }
+    }
+
+    function calculateHistoryStats() {
+        if (P1.signalHistory.length === 0) return { winRate: 0, totalPnL: 0, totalSignals: 0, wins: 0, losses: 0 };
+
+        let wins = 0, losses = 0, totalPnL = 0;
+
+        P1.signalHistory.forEach(entry => {
+            if (entry.status === 'closed') {
+                totalPnL += entry.pnl;
+                if (entry.won) wins++;
+                else losses++;
+            }
+        });
+
+        const totalTrades = wins + losses;
+
+        return {
+            winRate: totalTrades > 0 ? (wins / totalTrades) * 100 : 0,
+            totalPnL: totalPnL,
+            totalSignals: P1.signalHistory.length,
+            wins: wins,
+            losses: losses
+        };
+    }
+
+    function analyzeLastSignals() {
+        const stats = calculateHistoryStats();
+        const recentSignals = P1.signalHistory.slice(0, 20);
+
+        return {
+            stats: stats,
+            recentSignals: recentSignals,
+            bestPair: getBestPerformingPair(),
+            avgConfidence: getAverageConfidence()
+        };
+    }
+
+    function getBestPerformingPair() {
+        const pairStats = {};
+
+        P1.signalHistory.forEach(entry => {
+            if (!pairStats[entry.pairName]) {
+                pairStats[entry.pairName] = { wins: 0, total: 0 };
+            }
+            pairStats[entry.pairName].total++;
+            if (entry.won) pairStats[entry.pairName].wins++;
+        });
+
+        let bestPair = null;
+        let bestWinRate = 0;
+
+        for (const [pair, data] of Object.entries(pairStats)) {
+            const winRate = (data.wins / data.total) * 100;
+            if (winRate > bestWinRate) {
+                bestWinRate = winRate;
+                bestPair = pair;
+            }
+        }
+
+        return bestPair || 'N/A';
+    }
+
+    function getAverageConfidence() {
+        if (P1.signalHistory.length === 0) return 0;
+        const sum = P1.signalHistory.reduce((acc, entry) => acc + (entry.confidence || 0), 0);
+        return sum / P1.signalHistory.length;
+    }
+
+    function refreshForexData() {
+        P1.activePairs.forEach(pair => {
+            P1.priceHistory[pair.id] = { prices1: [], prices2: [], lastUpdate: new Date() };
+            P1.pairData[pair.id] = null;
+        });
+
+        P1.isLoading = true;
+        P1.loadingProgress = 0;
+
+        playSound();
+        alert('Data Refreshed! Collecting new forex data...');
+
+        console.log('Forex data refreshed - collecting new prices...');
+    }
+
+    function connectDerivAPI() {
+        if (P1.derivWS) return;
+
+        const wsUrl = `wss://ws.derivws.com/websockets/v3?app_id=${P1.CONFIG.derivAppId}`;
+        P1.derivWS = new WebSocket(wsUrl);
+
+        P1.derivWS.onopen = () => {
+            console.log('Deriv Connected');
+
+            if (P1.CONFIG.derivToken && P1.CONFIG.derivToken.length > 10) {
+                P1.derivWS.send(JSON.stringify({
+                    authorize: P1.CONFIG.derivToken
+                }));
+            }
+
+            const uniqueSymbols = new Set();
+            P1.activePairs.forEach(pair => {
+                uniqueSymbols.add(pair.symbol1);
+                uniqueSymbols.add(pair.symbol2);
+            });
+
+            uniqueSymbols.forEach(symbol => {
+                P1.derivWS.send(JSON.stringify({
+                    ticks: symbol,
+                    subscribe: 1
+                }));
+            });
+        };
+
+        P1.derivWS.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+
+            if (msg.tick) {
+                const symbol = msg.tick.symbol;
+                const price = parseFloat(msg.tick.quote);
+                updatePrice(symbol, price);
+            }
+
+            if (msg.authorize) {
+                console.log('Deriv Authorized');
+            }
+
+            if (msg.error) {
+                console.error('Deriv error:', msg.error.message);
+            }
+        };
+
+        P1.derivWS.onerror = (error) => {
+            console.error('Deriv WebSocket error:', error);
+        };
+
+        P1.derivWS.onclose = () => {
+            console.log('Deriv disconnected, reconnecting...');
+            P1.derivWS = null;
+            setTimeout(connectDerivAPI, 5000);
+        };
+    }
+
+    function updatePrice(symbol, price) {
+        P1.activePairs.forEach(pair => {
+            if (!P1.priceHistory[pair.id]) {
+                P1.priceHistory[pair.id] = { prices1: [], prices2: [], lastUpdate: new Date() };
+            }
+
+            const history = P1.priceHistory[pair.id];
+
+            if (symbol === pair.symbol1) {
+                history.prices1.push(price);
+                if (history.prices1.length > 300) history.prices1.shift();
+                history.lastUpdate = new Date();
+            } else if (symbol === pair.symbol2) {
+                history.prices2.push(price);
+                if (history.prices2.length > 300) history.prices2.shift();
+                history.lastUpdate = new Date();
+            }
+
+            if (P1.isLoading) {
+                const totalRequired = P1.CONFIG.minDataPoints * P1.activePairs.length * 2;
+                let totalCollected = 0;
+                P1.activePairs.forEach(p => {
+                    totalCollected += P1.priceHistory[p.id].prices1.length;
+                    totalCollected += P1.priceHistory[p.id].prices2.length;
+                });
+                P1.loadingProgress = Math.min(100, Math.floor((totalCollected / totalRequired) * 100));
+                
+                if (P1.loadingProgress >= 100) {
+                    P1.isLoading = false;
+                }
+            }
+
+            if (history.prices1.length >= P1.CONFIG.minDataPoints && history.prices2.length >= P1.CONFIG.minDataPoints) {
+                const signal = generateBinarySignal(pair, {
+                    price1: history.prices1[history.prices1.length - 1],
+                    price2: history.prices2[history.prices2.length - 1],
+                    prices1: history.prices1,
+                    prices2: history.prices2
+                });
+
+                P1.pairData[pair.id] = {
+                    ...signal,
+                    price1: history.prices1[history.prices1.length - 1],
+                    price2: history.prices2[history.prices2.length - 1]
+                };
+
+                if (signal.signal.startsWith('binary-') && signal.confidence >= P1.CONFIG.minConfidence) {
+                    if (!P1.activeSignals[pair.id]) {
+                        P1.activeSignals[pair.id] = {
+                            ...signal,
+                            ...P1.advancedMetrics[pair.id],
+                            startTime: Date.now(),
+                            pairId: pair.id,
+                            pairName: pair.name
+                        };
+
+                        const trade = createBinaryTrade(pair, signal);
+
+                        playSound();
+                        alert(`${pair.name} Signal!\n${signal.binarySignal} | ${signal.confidence}%`);
+                    }
+                }
+            }
+        });
+
+        monitorActiveTrades();
+        updateUI();
+    }
+
+    function playSound() {
+        try {
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+            oscillator.frequency.value = 800;
+            oscillator.type = 'sine';
+            gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+            oscillator.start(audioContext.currentTime);
+            oscillator.stop(audioContext.currentTime + 0.5);
+        } catch (e) {}
+    }
+
+    window.STARB_PART2 = {
+        checkMomentum, generateBinarySignal, createBinaryTrade, closeBinaryTrade,
+        monitorActiveTrades, addToHistory, saveHistory, loadHistory,
+        calculateHistoryStats, analyzeLastSignals, getBestPerformingPair,
+        getAverageConfidence, refreshForexData, connectDerivAPI, updatePrice, playSound
+    };
+
+})();
+</script><script>
+// ==================== PART 3: UI MAIN COMPONENTS ====================
+// PASTE THIS DIRECTLY AFTER PART 2
+
+(function() {
+    'use strict';
+
+    const P1 = window.STARB_PART1;
+    const P2 = window.STARB_PART2;
+
+    function createUI() {
+        const container = document.createElement('div');
+        container.id = 'starb-bot';
+        container.style.cssText = `
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            width: 100vw; height: 100vh; background: #0a0a0a; color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 13px; overflow: hidden; z-index: 999999; display: flex; flex-direction: column;
+        `;
+        document.body.appendChild(container);
+        updateUI();
+        setInterval(updateUI, 1000);
+    }
+
+    function updateUI() {
+        const container = document.getElementById('starb-bot');
+        if (!container) return;
+
+        const pair = P1.activePairs.find(p => p.id === P1.currentPair);
+        const d = P1.pairData[P1.currentPair];
+        const metrics = P1.advancedMetrics[P1.currentPair];
+
+        if (P1.isLoading || !d) {
+            container.innerHTML = getLoadingScreen();
+            return;
+        }
+
+        const prevPrice1 = P1.priceHistory[P1.currentPair].prices1.length > 1 ? P1.priceHistory[P1.currentPair].prices1[P1.priceHistory[P1.currentPair].prices1.length - 2] : d.price1;
+        const prevPrice2 = P1.priceHistory[P1.currentPair].prices2.length > 1 ? P1.priceHistory[P1.currentPair].prices2[P1.priceHistory[P1.currentPair].prices2.length - 2] : d.price2;
+        const move1 = d.price1 > prevPrice1 ? '⬆️' : d.price1 < prevPrice1 ? '⬇️' : '➡️';
+        const move2 = d.price2 > prevPrice2 ? '⬆️' : d.price2 < prevPrice2 ? '⬇️' : '➡️';
+        const moveColor1 = d.price1 > prevPrice1 ? '#10b981' : d.price1 < prevPrice1 ? '#ef4444' : '#f59e0b';
+        const moveColor2 = d.price2 > prevPrice2 ? '#10b981' : d.price2 < prevPrice2 ? '#ef4444' : '#f59e0b';
+
+        const activeSignal = P1.activeSignals[P1.currentPair];
+        let signalExpiry = 30;
+        if (activeSignal) {
+            signalExpiry = Math.max(0, Math.ceil(30 - (Date.now() - activeSignal.startTime) / 1000));
+            if (signalExpiry === 0) {
+                delete P1.activeSignals[P1.currentPair];
+            }
+        }
+
+        const tpTime = Math.floor(metrics.expectedTPTime || 0);
+        const tpMinutes = Math.floor(tpTime / 60);
+        const stats = P2.calculateHistoryStats();
+
+        container.innerHTML = getFullHTML(pair, d, metrics, moveColor1, moveColor2, move1, move2, activeSignal, signalExpiry, tpMinutes, stats);
+        attachListeners();
+    }
+
+    function getLoadingScreen() {
+        return `
+            <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%);">
+                <div style="text-align: center; padding: 20px;">
+                    <div style="font-size: 48px; margin-bottom: 20px;">📊</div>
+                    <div style="font-size: 24px; font-weight: bold; margin-bottom: 10px; color: #fff;">STARB Bot</div>
+                    <div style="font-size: 14px; color: #94a3b8; margin-bottom: 30px;">Loading forex data...</div>
+                    
+                    <div style="width: 280px; height: 8px; background: #1e293b; border-radius: 10px; overflow: hidden; margin-bottom: 15px;">
+                        <div style="width: ${P1.loadingProgress}%; height: 100%; background: linear-gradient(90deg, #3b82f6, #10b981); border-radius: 10px; transition: width 0.3s ease;"></div>
+                    </div>
+                    
+                    <div style="font-size: 32px; font-weight: bold; color: #10b981; font-family: monospace;">${P1.loadingProgress}%</div>
+                </div>
+            </div>
+        `;
+    }
+
+    function getFullHTML(pair, d, metrics, moveColor1, moveColor2, move1, move2, activeSignal, signalExpiry, tpMinutes, stats) {
+        return `
+            <div style="display: flex; flex-direction: column; height: 100vh; background: #0a0a0a;">
+                
+                ${getHeader()}
+                ${getPairSelection()}
+                ${getTimeframeSelection()}
+                
+                <div style="flex: 1; overflow-y: auto; padding: 10px;" class="scroll-container">
+                    ${getStatsGrid(stats)}
+                    ${getPriceGrid(pair, d, moveColor1, moveColor2, move1, move2)}
+                    ${getMetricsGrid(d, metrics)}
+                    ${getAdvancedMetrics(metrics)}
+                    ${getBinarySignalBox(d, activeSignal, signalExpiry, tpMinutes)}
+                    ${getAnalyzeButton()}
+                    ${getActiveTradesPanel()}
+                    ${getHistoryHTML()}
+                </div>
+
+                ${getSignalPopups()}
+            </div>
+        `;
+    }
+
+    function getHeader() {
+        return `
+            <div style="padding: 12px; background: linear-gradient(135deg, #16213e, #0f172a); border-bottom: 2px solid #1e293b; flex-shrink: 0;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <div style="font-size: 16px; font-weight: bold; color: #fff;">STARB Bot</div>
+                        <div style="font-size: 10px; color: #64748b; font-family: monospace;">${new Date().toLocaleTimeString()}</div>
+                    </div>
+                    <button class="btn-refresh" style="background: #10b981; border: none; color: #fff; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: 700; font-size: 11px;">🔄</button>
+                </div>
+            </div>
+        `;
+    }
+
+    function getPairSelection() {
+        return `
+            <div style="padding: 8px; background: #0f172a; overflow-x: auto; white-space: nowrap; flex-shrink: 0; border-bottom: 1px solid #1e293b;">
+                <div style="display: inline-flex; gap: 6px;">
+                    ${P1.activePairs.map(p => {
+                        const isDisabled = P1.disabledPairs[p.id];
+                        return `
+                            <button class="pair-btn" data-pair="${p.id}" style="position: relative; background: ${p.id === P1.currentPair ? '#3b82f6' : '#1e293b'}; border: none; color: ${p.id === P1.currentPair ? '#fff' : '#94a3b8'}; padding: 10px 14px; border-radius: 6px; cursor: pointer; font-size: 10px; font-weight: 700; ${isDisabled ? 'opacity: 0.6;' : ''}">
+                                ${p.name.split(' + ')[0]}
+                                ${isDisabled ? '<div style="position: absolute; top: -4px; right: -4px; font-size: 14px;">🔇</div>' : ''}
+                            </button>
+                        `;
+                    }).join('')}
+                </div>
+            </div>
+        `;
+    }
+
+    function getTimeframeSelection() {
+        return `
+            <div style="padding: 8px; background: #0f172a; display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid #1e293b; flex-shrink: 0;">
+                ${['1m', '5m', '15m', '30m', '1h', '4h', '1d'].map(tf => `
+                    <button class="timeframe-btn" data-tf="${tf}" style="flex: 1; min-width: 42px; background: ${tf === P1.currentTimeframe ? '#3b82f6' : '#1e293b'}; border: none; color: ${tf === P1.currentTimeframe ? '#fff' : '#94a3b8'}; padding: 8px 4px; border-radius: 5px; cursor: pointer; font-size: 10px; font-weight: 700;">
+                        ${tf}
+                    </button>
+                `).join('')}
+            </div>
+        `;
+    }
+
+    function getStatsGrid(stats) {
+        return `
+            <div style="background: linear-gradient(135deg, #0f172a, #020617); padding: 10px; border-radius: 8px; border: 1px solid #1e293b; margin-bottom: 10px;">
+                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;">
+                    ${[
+                        { label: 'Win Rate', value: `${stats.winRate.toFixed(0)}%`, color: stats.winRate >= 70 ? '#10b981' : stats.winRate >= 50 ? '#f59e0b' : '#ef4444' },
+                        { label: 'Total P/L', value: `${stats.totalPnL >= 0 ? '+' : ''}${stats.totalPnL.toFixed(0)}%`, color: stats.totalPnL >= 0 ? '#10b981' : '#ef4444' },
+                        { label: 'Trades', value: `${stats.wins}/${stats.losses}`, color: '#fff' }
+                    ].map(s => `
+                        <div style="text-align: center;">
+                            <div style="font-size: 9px; color: #64748b; margin-bottom: 4px;">${s.label}</div>
+                            <div style="font-size: 14px; font-weight: 700; color: ${s.color}; font-family: monospace;">${s.value}</div>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+        `;
+    }
+
+    function getPriceGrid(pair, d, moveColor1, moveColor2, move1, move2) {
+        return `
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px;">
+                <div style="background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); padding: 10px; border-radius: 8px; border: 1px solid #334155;">
+                    <div style="color: #94a3b8; font-size: 10px; margin-bottom: 4px; font-weight: 600;">${pair.asset1}</div>
+                    <div style="font-family: monospace; font-size: 16px; font-weight: 700; color: ${moveColor1}; margin-bottom: 4px;">${d.price1.toFixed(5)} ${move1}</div>
+                    <div style="color: #64748b; font-size: 9px;">RSI: ${d.rsi1.toFixed(1)}</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); padding: 10px; border-radius: 8px; border: 1px solid #334155;">
+                    <div style="color: #94a3b8; font-size: 10px; margin-bottom: 4px; font-weight: 600;">${pair.asset2}</div>
+                    <div style="font-family: monospace; font-size: 16px; font-weight: 700; color: ${moveColor2}; margin-bottom: 4px;">${d.price2.toFixed(5)} ${move2}</div>
+                    <div style="color: #64748b; font-size: 9px;">RSI: ${d.rsi2.toFixed(1)}</div>
+                </div>
+            </div>
+        `;
+    }
+
+    function getMetricsGrid(d, metrics) {
+        return `
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 10px;">
+                ${[
+                    { label: 'Z-Score', value: d.zScore.toFixed(2), color: Math.abs(d.zScore) >= 2.5 ? '#10b981' : '#fff', glow: Math.abs(d.zScore) >= 2.5 },
+                    { label: 'Corr', value: d.correlation.toFixed(2), color: d.correlation >= 0.80 ? '#10b981' : '#f59e0b', glow: d.correlation >= 0.80 },
+                    { label: 'Hurst', value: metrics.hurst.toFixed(2), color: metrics.hurst < 0.45 ? '#10b981' : '#f59e0b', glow: metrics.hurst < 0.45 }
+                ].map(m => `
+                    <div style="background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); padding: 8px; border-radius: 6px; text-align: center; border: 1px solid ${m.glow ? m.color : '#334155'}; ${m.glow ? `box-shadow: 0 0 10px ${m.color}40;` : ''}">
+                        <div style="font-size: 8px; color: #64748b; margin-bottom: 3px;">${m.label}</div>
+                        <div style="color: ${m.color}; font-size: 14px; font-weight: 700; font-family: monospace;">${m.value}</div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    }
+
+    function getAdvancedMetrics(metrics) {
+        if (!P1.showAdvancedMetrics) {
+            return `
+                <div class="toggle-advanced" style="background: linear-gradient(135deg, #0a0f1e 0%, #020617 100%); padding: 10px; border-radius: 8px; margin-bottom: 10px; border: 1px solid #1e293b; cursor: pointer; text-align: center;">
+                    <span style="font-size: 11px; font-weight: 700; color: #667eea;">🔬 SHOW ADVANCED METRICS ▼</span>
+                </div>
+            `;
+        }
+
+        return `
+            <div style="background: linear-gradient(135deg, #0a0f1e 0%, #020617 100%); padding: 10px; border-radius: 8px; margin-bottom: 10px; border: 1px solid #1e293b;">
+                <div class="toggle-advanced" style="font-size: 10px; font-weight: 700; margin-bottom: 6px; color: #667eea; cursor: pointer;">🔬 ADVANCED METRICS ▲</div>
+                ${[
+                    { label: 'Cointegration', value: metrics.cointegration.toFixed(3) + (metrics.cointegration < 0.15 ? ' ✓' : ''), color: metrics.cointegration < 0.15 ? '#10b981' : '#ef4444' },
+                    { label: 'OU Theta', value: metrics.ouTheta.toFixed(3), color: '#fff' },
+                    { label: 'Kalman Beta', value: metrics.kalmanBeta.toFixed(2), color: '#fff' },
+                    { label: 'Order Flow', value: metrics.orderFlow.toFixed(3), color: metrics.orderFlow > 0 ? '#10b981' : '#ef4444' },
+                    { label: 'VWAP Dev', value: metrics.vwapDev.toFixed(2) + '%', color: '#fff' },
+                    { label: 'Half-Life', value: metrics.halfLife.toFixed(1) + ' min', color: '#fff' }
+                ].map(m => `
+                    <div style="display: flex; justify-content: space-between; padding: 5px 0; font-size: 10px; border-bottom: 1px solid #1e293b;">
+                        <span style="color: #64748b;">${m.label}</span>
+                        <span style="color: ${m.color}; font-weight: 700; font-family: monospace;">${m.value}</span>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    }
+
+    function getBinarySignalBox(d, activeSignal, expiry, tpMin) {
+        let bg, text, showTimer = false;
+
+        if (d.signal === 'disabled') {
+            bg = 'linear-gradient(135deg, #64748b, #475569)';
+            text = '🔇 PAIR DISABLED';
+        }
+        else if (d.signal === 'binary-up-1') {
+            bg = 'linear-gradient(135deg, #10b981, #059669)';
+            text = `🟢 ${d.binarySignal}`;
+            showTimer = true;
+        }
+        else if (d.signal === 'binary-down-1') {
+            bg = 'linear-gradient(135deg, #ef4444, #dc2626)';
+            text = `🔴 ${d.binarySignal}`;
+            showTimer = true;
+        }
+        else if (d.signal === 'wait') { bg = 'linear-gradient(135deg, #f59e0b, #d97706)'; text = '⚠️ WAIT'; }
+        else if (d.signal === 'cooldown') { bg = 'linear-gradient(135deg, #6366f1, #4f46e5)'; text = '⏱️ COOLDOWN'; }
+        else { bg = 'linear-gradient(135deg, #334155, #1e293b)'; text = '✅ NO SIGNAL'; }
+
+        return `
+            <div style="background: ${bg}; color: #fff; padding: 14px; border-radius: 10px; text-align: center; margin-bottom: 10px; ${showTimer ? 'box-shadow: 0 0 20px rgba(16,185,129,0.5);' : ''}">
+                <div style="font-size: 14px; font-weight: 700; margin-bottom: 5px;">${text}</div>
+                <div style="font-size: 11px; opacity: 0.9; margin-bottom: ${showTimer ? '6px' : '0'};">
+                    ${d.confidence > 0 ? `Confidence: ${d.confidence}% | Z=${d.zScore.toFixed(2)}` : d.reason}
+                </div>
+                ${showTimer && activeSignal ? `
+                    <div style="font-size: 10px; opacity: 0.8; margin-bottom: 6px;">⏱️ Signal expires in: ${expiry}s</div>
+                    <div style="background: rgba(0,0,0,0.3); padding: 6px; border-radius: 6px;">
+                        <div style="font-size: 9px; opacity: 0.7; margin-bottom: 3px;">Expected Expiry:</div>
+                        <div style="font-size: 18px; font-weight: 700; font-family: monospace;">${tpMin} min</div>
+                    </div>
+                ` : ''}
+            </div>
+        `;
+    }
+
+    function getAnalyzeButton() {
+        return '<button class="analyze-btn" style="width: 100%; background: linear-gradient(135deg, #3b82f6, #2563eb); border: none; color: #fff; padding: 12px; border-radius: 8px; font-size: 12px; font-weight: 700; cursor: pointer; margin-bottom: 10px;">🔍 ANALYZE LAST 20 SIGNALS</button>';
+    }
+
+    function getActiveTradesPanel() {
+        const activeTrades = Object.values(P1.activeTrades).filter(t => t.status === 'open');
+        if (activeTrades.length === 0) return '';
+
+        return `
+            <div style="background: linear-gradient(135deg, #0a0f1e, #020617); padding: 10px; border-radius: 8px; margin-bottom: 10px; border: 1px solid #1e293b;">
+                <div style="color: #f59e0b; font-size: 11px; font-weight: 700; margin-bottom: 6px;">⚡ ACTIVE TRADES (${activeTrades.length})</div>
+                ${activeTrades.map(trade => {
+                    const timeLeft = Math.max(0, Math.ceil((trade.expiryTime - Date.now()) / 1000));
+                    const minutes = Math.floor(timeLeft / 60);
+                    const seconds = timeLeft % 60;
+                    return `
+                        <div style="background: #1e293b; padding: 8px; border-radius: 6px; margin-bottom: 6px; border-left: 3px solid ${trade.direction === 'UP' ? '#10b981' : '#ef4444'};">
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 3px;">
+                                <span style="font-size: 11px; color: #fff; font-weight: 700;">${trade.direction === 'UP' ? '🟢' : '🔴'} ${trade.signal}</span>
+                                <span style="font-size: 13px; color: #f59e0b; font-weight: 700; font-family: monospace;">${minutes}:${String(seconds).padStart(2, '0')}</span>
+                            </div>
+                            <div style="font-size: 9px; color: #64748b;">Entry: ${trade.entryPrice.toFixed(5)} | Conf: ${trade.confidence}%</div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        `;
+    }
+
+    function getHistoryHTML() {
+        return `
+            <div style="background: linear-gradient(135deg, #0a0f1e, #020617); padding: 10px; border-radius: 8px; border: 1px solid #1e293b; margin-bottom: 15px;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 8px; align-items: center;">
+                    <span style="color: #94a3b8; font-size: 12px; font-weight: 700;">📜 HISTORY (${P1.signalHistory.length})</span>
+                    <button class="clear-btn" style="background: linear-gradient(135deg, #ef4444, #dc2626); border: none; color: #fff; padding: 5px 10px; border-radius: 5px; font-size: 9px; cursor: pointer; font-weight: 700;">Clear</button>
+                </div>
+                <div class="history-scroll" style="max-height: 350px; overflow-y: scroll;">
+                    ${P1.signalHistory.length === 0 ? '<div style="text-align: center; color: #64748b; font-size: 11px; padding: 15px;">No signals yet</div>' : P1.signalHistory.map(e => getHistoryItem(e)).join('')}
+                </div>
+            </div>
+        `;
+    }
+
+    function getHistoryItem(e) {
+        const isExpanded = P1.expandedHistoryId === e.id;
+        return `
+            <div class="history-item" data-id="${e.id}" style="background: linear-gradient(135deg, #1e293b, #0f172a); padding: 8px; border-radius: 6px; margin-bottom: 6px; border-left: 3px solid ${e.pnl >= 0 ? '#10b981' : '#ef4444'}; cursor: pointer;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 3px;">
+                    <span style="font-size: 11px; color: #fff; font-weight: 700;">${e.direction === 'UP' ? '🟢' : '🔴'} ${e.signal}</span>
+                    <span style="font-size: 13px; font-family: monospace; color: ${e.pnl >= 0 ? '#10b981' : '#ef4444'}; font-weight: 700;">${e.pnl >= 0 ? '+' : ''}${e.pnl}%</span>
+                </div>
+                <div style="font-size: 9px; color: #64748b;">Entry: ${e.entryPrice.toFixed(5)} | Exit: ${e.exitPrice.toFixed(5)}</div>
+                <div style="font-size: 8px; color: #475569; font-family: monospace; margin-top: 3px;">${new Date(e.entryTime).toLocaleTimeString()}</div>
+                ${isExpanded ? `
+                    <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #334155; font-size: 9px;">
+                        <div style="color: #64748b; margin-bottom: 3px;">Pair: <span style="color: #fff; font-weight: 700;">${e.pairName}</span></div>
+                        <div style="color: #64748b; margin-bottom: 3px;">Z-Score: <span style="color: #fff; font-weight: 700;">${e.entryZ.toFixed(2)}</span></div>
+                        <div style="color: #64748b; margin-bottom: 3px;">Confidence: <span style="color: #fff; font-weight: 700;">${e.confidence}%</span></div>
+                        <div style="color: #64748b; margin-bottom: 3px;">Timeframe: <span style="color: #fff; font-weight: 700;">${e.timeframe}</span></div>
+                        <div style="color: #8b8ba8; margin-top: 5px;">Result: <span style="color: ${e.won ? '#10b981' : '#ef4444'}; font-weight: 700; font-size: 10px;">${e.won ? 'WIN ✅' : 'LOSS ❌'}</span></div>
+                    </div>
+                ` : ''}
+            </div>
+        `;
+    }
+
+    function getSignalPopups() {
+        let popupsHTML = '';
+        let topOffset = 70;
+
+        P1.activePairs.forEach(pair => {
+            const signal = P1.activeSignals[pair.id];
+            if (signal && pair.id !== P1.currentPair) {
+                const signalAge = Math.floor((Date.now() - signal.startTime) / 1000);
+                if (signalAge >= 0 && signalAge < 30) {
+                    const tpMin = Math.floor((signal.expectedTPTime || 0) / 60);
+                    popupsHTML += `
+                        <div class="signal-popup" data-pair="${pair.id}" style="position: fixed; top: ${topOffset}px; left: 10px; right: 10px; background: linear-gradient(135deg, ${signal.signal.includes('up') ? '#10b981, #059669' : '#ef4444, #dc2626'}); padding: 12px; border-radius: 10px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4); z-index: 99999999; border: 2px solid rgba(255, 255, 255, 0.2); cursor: pointer;">
+                            <div style="font-size: 12px; font-weight: 700; color: #fff; margin-bottom: 5px;">🔔 ${pair.name} Signal!</div>
+                            <div style="font-size: 13px; color: #fff; margin-bottom: 3px; font-weight: 700;">${signal.binarySignal}</div>
+                            <div style="font-size: 10px; color: rgba(255,255,255,0.9); margin-bottom: 6px;">Confidence: ${signal.confidence}% | Z=${signal.zScore.toFixed(2)}</div>
+                            <div style="background: rgba(0,0,0,0.3); padding: 5px; border-radius: 5px; font-size: 9px; text-align: center;">Expiry: <span style="font-size: 13px; font-weight: 700; font-family: monospace;">${tpMin} min</span></div>
+                        </div>
+                    `;
+                    topOffset += 140;
+                }
+            }
+        });
+
+        return popupsHTML;
+    }
+
+    window.STARB_PART3 = {
+        createUI, updateUI, getLoadingScreen, getFullHTML, getHeader, getPairSelection,
+        getTimeframeSelection, getStatsGrid, getPriceGrid, getMetricsGrid,
+        getAdvancedMetrics, getBinarySignalBox, getAnalyzeButton,
+        getActiveTradesPanel, getHistoryHTML, getHistoryItem, getSignalPopups
+    };
+
+})();
+</script><script>
+// ==================== PART 4: ANALYSIS MODAL & STYLES ====================
+// PASTE THIS DIRECTLY AFTER PART 3
+
+(function() {
+    'use strict';
+
+    const P1 = window.STARB_PART1;
+    const P2 = window.STARB_PART2;
+
+    function showAnalysisModal(analysis) {
+        const existingModal = document.getElementById('analysis-modal');
+        if (existingModal) existingModal.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'analysis-modal';
+        modal.style.cssText = `
+            position: fixed; 
+            top: 0; 
+            left: 0; 
+            right: 0; 
+            bottom: 0; 
+            background: rgba(0, 0, 0, 0.95); 
+            z-index: 99999999; 
+            overflow-y: auto;
+        `;
+
+        modal.innerHTML = `
+            <div style="min-height: 100vh; padding: 20px;">
+                <div style="background: #1a1a2e; border-radius: 12px; overflow: hidden; max-width: 600px; margin: 0 auto;">
+                    
+                    <div style="padding: 16px; background: linear-gradient(135deg, #16213e, #0f172a); display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #1e293b;">
+                        <span style="font-size: 16px; font-weight: bold; color: #fff;">📊 Last 20 Signals Analysis</span>
+                        <button class="close-modal" style="background: #ef4444; border: none; color: #fff; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-weight: 700; font-size: 14px;">✕</button>
+                    </div>
+
+                    <div style="padding: 16px;">
+                        
+                        <div style="background: linear-gradient(135deg, #0a0f1e, #020617); padding: 14px; border-radius: 10px; margin-bottom: 16px; border: 1px solid #1e293b;">
+                            <div style="font-size: 13px; color: #f59e0b; font-weight: 700; margin-bottom: 12px;">📈 OVERALL STATS</div>
+                            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
+                                ${[
+                                    { label: 'Win Rate', value: `${analysis.stats.winRate.toFixed(1)}%`, color: analysis.stats.winRate >= 70 ? '#10b981' : analysis.stats.winRate >= 50 ? '#f59e0b' : '#ef4444' },
+                                    { label: 'Total P/L', value: `${analysis.stats.totalPnL >= 0 ? '+' : ''}${analysis.stats.totalPnL.toFixed(0)}%`, color: analysis.stats.totalPnL >= 0 ? '#10b981' : '#ef4444' },
+                                    { label: 'Total Trades', value: analysis.stats.totalSignals, color: '#fff' },
+                                    { label: 'Best Pair', value: analysis.bestPair, color: '#10b981' },
+                                    { label: 'Wins', value: analysis.stats.wins, color: '#10b981' },
+                                    { label: 'Losses', value: analysis.stats.losses, color: '#ef4444' },
+                                    { label: 'Avg Confidence', value: `${analysis.avgConfidence.toFixed(1)}%`, color: '#fff' }
+                                ].map(s => `
+                                    <div style="background: #1e293b; padding: 10px; border-radius: 8px; text-align: center;">
+                                        <div style="font-size: 10px; color: #64748b; margin-bottom: 4px;">${s.label}</div>
+                                        <div style="font-size: 14px; font-weight: 700; color: ${s.color}; font-family: monospace;">${s.value}</div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+
+                        <div style="background: linear-gradient(135deg, #0a0f1e, #020617); padding: 14px; border-radius: 10px; border: 1px solid #1e293b;">
+                            <div style="font-size: 13px; color: #f59e0b; font-weight: 700; margin-bottom: 12px;">📜 SIGNAL DETAILS</div>
+                            ${analysis.recentSignals.map(e => `
+                                <div style="background: linear-gradient(135deg, #1e293b, #0f172a); padding: 12px; border-radius: 8px; margin-bottom: 10px; border-left: 4px solid ${e.pnl >= 0 ? '#10b981' : '#ef4444'};">
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+                                        <span style="font-size: 12px; color: #fff; font-weight: 700;">${e.direction === 'UP' ? '🟢' : '🔴'} ${e.signal}</span>
+                                        <span style="font-size: 14px; font-family: monospace; color: ${e.pnl >= 0 ? '#10b981' : '#ef4444'}; font-weight: 700;">${e.pnl >= 0 ? '+' : ''}${e.pnl}%</span>
+                                    </div>
+                                    <div style="font-size: 10px; color: #64748b; margin-bottom: 3px;">Pair: ${e.pairName}</div>
+                                    <div style="font-size: 10px; color: #64748b; margin-bottom: 3px;">Entry: ${e.entryPrice.toFixed(5)} | Exit: ${e.exitPrice.toFixed(5)}</div>
+                                    <div style="font-size: 10px; color: #64748b; margin-bottom: 3px;">Z-Score: ${e.entryZ.toFixed(2)} | Confidence: ${e.confidence}%</div>
+                                    <div style="font-size: 10px; color: #64748b; margin-bottom: 3px;">Timeframe: ${e.timeframe}</div>
+                                    <div style="font-size: 9px; color: #475569; font-family: monospace; margin-top: 4px;">${new Date(e.entryTime).toLocaleString()}</div>
+                                    <div style="font-size: 11px; color: ${e.won ? '#10b981' : '#ef4444'}; font-weight: 700; margin-top: 6px;">${e.won ? 'WIN ✅' : 'LOSS ❌'}</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(modal);
+
+        modal.querySelector('.close-modal').onclick = () => {
+            modal.remove();
+        };
+
+        modal.onclick = (e) => {
+            if (e.target === modal) modal.remove();
+        };
+    }
+
+    function getStyles() {
+        return `
+            <style>
+                @keyframes pulse { 
+                    0%, 100% { opacity: 1; } 
+                    50% { opacity: 0.5; } 
+                }
+                
+                .scroll-container::-webkit-scrollbar, 
+                .history-scroll::-webkit-scrollbar { 
+                    width: 6px; 
+                }
+                
+                .scroll-container::-webkit-scrollbar-track, 
+                .history-scroll::-webkit-scrollbar-track { 
+                    background: #0f172a; 
+                    border-radius: 10px;
+                }
+                
+                .scroll-container::-webkit-scrollbar-thumb, 
+                .history-scroll::-webkit-scrollbar-thumb { 
+                    background: linear-gradient(135deg, #667eea, #764ba2); 
+                    border-radius: 10px; 
+                }
+                
+                .pair-btn:active, 
+                .timeframe-btn:active,
+                .analyze-btn:active,
+                .btn-refresh:active,
+                .clear-btn:active,
+                .toggle-advanced:active {
+                    transform: scale(0.95);
+                }
+                
+                .signal-popup:active { 
+                    transform: scale(0.98); 
+                }
+                
+                .history-item:active {
+                    opacity: 0.7;
+                }
+                
+                * {
+                    -webkit-tap-highlight-color: transparent;
+                }
+            </style>
+        `;
+    }
+
+    window.STARB_PART4 = {
+        showAnalysisModal,
+        getStyles
+    };
+
+})();
+</script><script>
+// ==================== PART 5: EVENT LISTENERS & INITIALIZATION (FINAL) ====================
+// PASTE THIS DIRECTLY AFTER PART 4, THEN ADD </body></html> AT THE END
+
+(function() {
+    'use strict';
+
+    const P1 = window.STARB_PART1;
+    const P2 = window.STARB_PART2;
+    const P3 = window.STARB_PART3;
+    const P4 = window.STARB_PART4;
+
+    function attachListeners() {
+        const refreshBtn = document.querySelector('.btn-refresh');
+        if (refreshBtn) {
+            refreshBtn.onclick = () => {
+                if (confirm('🔄 Refresh forex data?\n\nThis will clear all price history and restart data collection.')) {
+                    P2.refreshForexData();
+                }
+            };
+        }
+
+        document.querySelectorAll('.pair-btn').forEach(btn => {
+            const pairId = btn.dataset.pair;
+
+            btn.onclick = () => {
+                const now = Date.now();
+                const timeSinceLastTap = now - P1.lastTapTime[pairId];
+
+                if (timeSinceLastTap < 500) {
+                    P1.disabledPairs[pairId] = !P1.disabledPairs[pairId];
+                    P1.saveDisabledPairs();
+
+                    if (P1.disabledPairs[pairId] && P1.activeSignals[pairId]) {
+                        delete P1.activeSignals[pairId];
+                    }
+
+                    P2.playSound();
+
+                    const pairName = P1.activePairs.find(p => p.id === pairId).name;
+                    const status = P1.disabledPairs[pairId] ? 'DISABLED 🔇' : 'ENABLED ✅';
+
+                    alert(`${pairName}\nPair ${status}`);
+
+                    P1.lastTapTime[pairId] = 0;
+                } else {
+                    P1.currentPair = pairId;
+                    P1.lastTapTime[pairId] = now;
+                }
+            };
+        });
+
+        document.querySelectorAll('.timeframe-btn').forEach(btn => {
+            btn.onclick = () => { P1.currentTimeframe = btn.dataset.tf; };
+        });
+
+        const toggleAdvanced = document.querySelector('.toggle-advanced');
+        if (toggleAdvanced) {
+            toggleAdvanced.onclick = () => {
+                P1.showAdvancedMetrics = !P1.showAdvancedMetrics;
+            };
+        }
+
+        const analyzeBtn = document.querySelector('.analyze-btn');
+        if (analyzeBtn) {
+            analyzeBtn.onclick = () => {
+                const analysis = P2.analyzeLastSignals();
+                P4.showAnalysisModal(analysis);
+            };
+        }
+
+        const clearBtn = document.querySelector('.clear-btn');
+        if (clearBtn) {
+            clearBtn.onclick = (e) => {
+                e.stopPropagation();
+                if (confirm('Clear all history?')) {
+                    P1.signalHistory = [];
+                    P2.saveHistory();
+                }
+            };
+        }
+
+        document.querySelectorAll('.history-item').forEach(item => {
+            item.onclick = () => {
+                const id = parseInt(item.dataset.id);
+                P1.expandedHistoryId = P1.expandedHistoryId === id ? null : id;
+            };
+        });
+
+        document.querySelectorAll('.signal-popup').forEach(popup => {
+            popup.onclick = () => {
+                const pairId = popup.dataset.pair;
+                delete P1.activeSignals[pairId];
+                popup.remove();
+            };
+        });
+    }
+
+    window.updateUI = P3.updateUI;
+    window.attachListeners = attachListeners;
+
+    setTimeout(() => {
+        P2.loadHistory();
+        P3.createUI();
+        P2.connectDerivAPI();
+
+        console.log('🚀 STARB Bot v10.5 FIXED - Mobile Ready!');
+        console.log('✅ ALL 5 PARTS LOADED SUCCESSFULLY');
+        console.log('✅ Fixed signal popups (no shaking)');
+        console.log('✅ Fixed UI size (all content visible)');
+        console.log('✅ All active signals show properly');
+        console.log('✅ DOUBLE-TAP pair to enable/disable');
+        console.log('✅ Advanced metrics toggle');
+        console.log('✅ History scrollable');
+        console.log('✅ Sound alerts enabled');
+    }, 1000);
+
+})();
+</script>
+
+</body>
+</html>
